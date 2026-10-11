@@ -1,0 +1,10 @@
+[[plugin]]
+id = "nmc/mihomo-control"
+name = "Mihomo Control"
+version = "0.1.0"
+plugin_api = 24
+author = "Mihomo Control contributors"
+license = "MIT"
+icon = "network"
+tags = ["network", "utility", "indicator"]
+description = "Local Mihomo controller with an optional external lifecycle adapter."

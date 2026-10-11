@@ -1,0 +1,54 @@
+id = "nmc/mihomo-control"
+name = "Mihomo Control"
+version = "0.1.0"
+plugin_api = 24
+author = "Mihomo Control contributors"
+license = "MIT"
+icon = "network"
+tags = ["network", "utility", "indicator"]
+description = "Local Mihomo controller with an optional external lifecycle adapter."
+
+[[setting]]
+key = "controller_port"
+type = "int"
+label_key = "settings.port"
+default = 9090
+min = 1
+max = 65535
+
+[[setting]]
+key = "controller_secret"
+type = "string"
+label_key = "settings.secret"
+description_key = "settings.secret_description"
+default = ""
+
+[[setting]]
+key = "helper_path"
+type = "file"
+label_key = "settings.helper"
+description_key = "settings.helper_description"
+default = ""
+
+[[setting]]
+key = "test_url"
+type = "string"
+label_key = "settings.test_url"
+default = "https://www.gstatic.com/generate_204"
+
+[[service]]
+id = "service"
+entry = "service.luau"
+
+[[widget]]
+id = "widget"
+entry = "widget.luau"
+
+[[panel]]
+id = "panel"
+entry = "panel.luau"
+width = 520
+height = 640
+placement = "attached"
+open_near_click = true
+keyboard_focus = "on_demand"
