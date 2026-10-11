@@ -4,6 +4,7 @@ local bodies = {
   version = { version = "test" }, config = { mode = "rule" },
   groups = { proxies = { { name = "Choice", type = "Selector", now = "A", all = { "A", "B" } } } },
   connections = { connections = { { id = "id-1", metadata = { host = "example.test" }, chains = { "Choice" } } } },
+  empty_connections = { connections = nil },
   delay = { A = 10, B = 20 }, traffic = { up = 10, down = 20 },
 }
 local host = {
@@ -75,7 +76,14 @@ local function respond_all(path, body)
 end
 
 assert(state["nmc.snapshot"].status == "offline")
-env.update()
+-- A disabled unit is a normal offline state, even over repeated polls.
+helper("status", "stopped\n")
+assert(state["nmc.snapshot"].status == "offline")
+clock = clock + 6; env.update(); env.update(); env.update()
+helper("status", "stopped\n")
+assert(state["nmc.snapshot"].status == "offline" and state["nmc.snapshot"].error == "")
+commands["nmc.command"]({ op = "refresh" })
+helper("status", "running\n")
 respond("/version", "version")
 respond_all("/configs", "config")
 respond_all("/group", "groups")
@@ -83,6 +91,14 @@ respond_all("/connections", "connections")
 assert(state["nmc.snapshot"].status == "running")
 assert(state["nmc.snapshot"].down == 20)
 assert(state["nmc.snapshot"].count == 1)
+
+-- Mihomo can serialize the empty collection as null; old connections vanish.
+clock = clock + 2; env.update()
+respond_all("/connections", "empty_connections")
+assert(state["nmc.snapshot"].count == 0)
+assert(#state["nmc.snapshot"].connections == 0)
+respond_all("/configs", "config")
+respond_all("/group", "groups")
 
 commands["nmc.command"]({ op = "mode", mode = "global" })
 local request = respond("/configs", "", 204)
@@ -93,8 +109,8 @@ assert(request.method == "PUT")
 commands["nmc.command"]({ op = "select", group = "Choice", node = "bad" })
 for _, entry in ipairs(callbacks) do assert(not (entry.req and entry.req.method == "PUT")) end
 commands["nmc.command"]({ op = "close", id = "id-1" })
-request = respond("/connections/id-1", "", 204)
-assert(request.method == "DELETE")
+-- A cleared connection must no longer be actionable.
+for _, entry in ipairs(callbacks) do assert(not (entry.req and entry.req.method == "DELETE")) end
 
 commands["nmc.command"]({ op = "stop" })
 assert(state["nmc.snapshot"].status == "stopping")
@@ -104,6 +120,14 @@ assert(state["nmc.snapshot"].status == "offline")
 assert(not state["nmc.operation"].busy)
 commands["nmc.command"]({ op = "start" })
 helper("start")
+helper("status", "running\n")
+assert(state["nmc.operation"].stage == "api")
+respond("/version", "", 503)
+clock = clock + 125; env.update()
+assert(state["nmc.snapshot"].status == "starting")
+assert(state["nmc.operation"].busy and state["nmc.operation"].remaining <= 55)
+commands["nmc.command"]({ op = "refresh" })
+helper("status", "running\n")
 respond("/version", "version")
 respond_all("/configs", "config")
 respond_all("/group", "groups")
@@ -126,13 +150,46 @@ for i, entry in ipairs(callbacks) do
   end
 end
 assert(state["nmc.snapshot"].status == "starting")
-commands["nmc.command"]({ op = "refresh" })
 respond("/version", "version")
 assert(state["nmc.snapshot"].status == "running")
 
 commands["nmc.command"]({ op = "refresh" })
+helper("status", "running\n")
 respond("/version", "", 401)
 assert(state["nmc.snapshot"].status == "error")
 assert(state["nmc.snapshot"].error == "unauthorized")
 assert(state["nmc.snapshot"].down == 0)
+
+-- Service reports running but controller is unavailable: this is an error.
+commands["nmc.command"]({ op = "refresh" })
+helper("status", "running\n")
+respond("/version", "", 503)
+assert(state["nmc.snapshot"].status == "error")
+
+-- Cancellation ends the long wait and drops a late successful callback.
+commands["nmc.command"]({ op = "restart_service" })
+helper("restart")
+helper("status", "running\n")
+assert(state["nmc.operation"].stage == "api")
+commands["nmc.command"]({ op = "cancel_wait" })
+assert(not state["nmc.operation"].busy)
+assert(state["nmc.snapshot"].service_state == "running")
+respond("/version", "version")
+assert(state["nmc.snapshot"].status == "error")
+assert(state["nmc.snapshot"].error == "health check cancelled")
+
+commands["nmc.command"]({ op = "restart_service" })
+helper("restart")
+helper("status", "running\n")
+clock = clock + 181; env.update()
+assert(state["nmc.snapshot"].status == "error")
+assert(state["nmc.snapshot"].error == "health check timeout")
+assert(not state["nmc.operation"].busy)
+respond("/version", "version")
+assert(state["nmc.snapshot"].status == "error", "late probe resurrected state")
+
+commands["nmc.command"]({ op = "refresh" })
+helper("status", "", 1)
+assert(state["nmc.snapshot"].status == "error")
+assert(state["nmc.snapshot"].error == "helper status failed")
 print("service: ok")

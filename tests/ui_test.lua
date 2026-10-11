@@ -26,6 +26,13 @@ local function contains(node, value)
   end
   return false
 end
+local function find_button(node, value)
+  if node.kind == "button" and node.props.text == value then return node end
+  for _, child in ipairs(node.children or {}) do
+    local found = find_button(child, value)
+    if found then return found end
+  end
+end
 local panel_env = setmetatable({ noctalia = host, ui = ui,
   panel = { render = function(tree) rendered.panel = tree end, close = function() end } }, { __index = _G })
 assert(loadfile("mihomo-control/panel.luau", "t", panel_env))()
@@ -41,6 +48,19 @@ watches["nmc.snapshot"](online)
 assert(contains(rendered.panel, "Choice"))
 assert(contains(rendered.panel, "example.test"))
 assert(contains(rendered.panel, "stop"))
+
+online.status, online.service_state = "offline", "stopped"
+watches["nmc.snapshot"](online)
+assert(contains(rendered.panel, "stopped_title"))
+assert(find_button(rendered.panel, "start").props.enabled)
+assert(not find_button(rendered.panel, "stop").props.enabled)
+online.status, online.service_state = "starting", "running"
+watches["nmc.snapshot"](online)
+watches["nmc.operation"]({ busy = true, name = "start", stage = "api", remaining = 150, error = "" })
+assert(contains(rendered.panel, "waiting_api 150s"))
+assert(find_button(rendered.panel, "cancel_wait").props.enabled)
+watches["nmc.operation"]({ busy = false, error = "" })
+online.status = "running"
 
 -- A large controller response must stay below Noctalia's 256-child UI limit.
 online.groups = {}
