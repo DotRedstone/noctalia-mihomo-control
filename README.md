@@ -29,7 +29,7 @@ noctalia msg plugins source add nmc-dev path "$PWD"
 noctalia msg plugins enable nmc/mihomo-control
 ```
 
-也可以将 `mihomo-control/` 安装为 `$XDG_DATA_HOME/noctalia/plugins/mihomo-control/`，然后启用插件。发布 Git 仓库后，用户可将该仓库作为 `git` source 添加；仓库根目录的 `catalog.toml` 可供 Noctalia 索引。当前仓库没有远程 URL，因此发布前请自行选择托管地址和唯一的插件作者前缀；若修改 ID，需同步更新 manifest、catalog、widget、文档和配置示例。
+也可以将 `mihomo-control/` 安装为 `$XDG_DATA_HOME/noctalia/plugins/mihomo-control/`，然后启用插件。用户可将发布仓库作为 `git` source 添加；仓库根目录的 `catalog.toml` 可供 Noctalia 索引。插件 ID `nmc/mihomo-control` 已在首个发布版本中固定。
 
 在 Noctalia Settings → Plugins 中设置 `controller_port`（默认 `9090`）和可选的 `controller_secret`。密钥保存在用户自己的 Noctalia 设置中，作为 `Authorization: Bearer` 头发送给本机 API。设置 `helper_path` 前不会出现启动、停止、服务重启按钮。测速 URL 默认是一个通用的 204 探测地址，可按网络环境改成自己可信的 URL；该 URL 由 Mihomo 执行测速，插件只把它作为 URL 编码后的参数送到本机控制器。
 
@@ -56,7 +56,9 @@ end = ["mihomo"] # 合并进现有 end 数组，不要覆盖其他 widget
 <helper> restart
 ```
 
-`status` 需在 stdout 第一行输出 `running` 或 `stopped` 并以 0 退出；其他输出或非零退出视为错误。`start/stop/restart` 成功时以 0 退出，失败时非零退出；插件不依赖 stderr 中的特定文本，避免泄露实现细节。helper 应自行限制可操作的目标和参数，并在 12 秒内退出。插件在约 18 秒仍未收到结果时报告超时，忽略迟到回调。启动与服务重启以本机 `/version` API 恢复作为健康检查；停止之后再次调用 `status`，确认 `stopped` 才显示离线。
+`status` 需在 stdout 第一行输出 `running` 或 `stopped` 并以 0 退出；其他输出或非零退出视为错误。`start/stop/restart` 成功时以 0 退出，失败时非零退出；插件不依赖 stderr 中的特定文本，避免泄露实现细节。helper 应自行限制可操作的目标和参数，并在 12 秒内退出。插件在约 18 秒仍未收到服务操作结果时报告超时，随后再次调用 `status` 确认服务状态。已停止的服务显示为正常离线；helper 失败，或报告 `running` 但 API 不可用，才显示异常。
+
+启动与服务重启分两步显示：helper 返回成功且 `status` 为 `running` 后，面板进入“等待 API”状态；本机 `/version` 最长可等待约 180 秒，以容纳首次 Geo 数据初始化。面板显示剩余时间，可取消等待；取消不会停止服务，也不会接受迟到的 API 回调。健康检查超时会显示异常，点“刷新”可重新查询。核心 API 重启同样等待 `/version` 恢复。停止后再次调用 `status`，确认 `stopped` 才显示离线。
 
 helper 是**宿主提供**的权限边界，不由插件生成、安装或提权。只配置可信、不可由低权限用户改写的 helper。插件的 Luau VM 是隔离执行环境，但 Noctalia 官方明确指出插件是可信代码，安装插件等同运行用户脚本。操作系统级授权必须由宿主单独约束，示例见 [NixOS dotfiles 接入](docs/dotfiles-integration.md)。
 
