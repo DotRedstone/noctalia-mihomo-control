@@ -336,7 +336,12 @@ local function command(cmd)
   operation = { busy = true, name = op, error = "" }; publish_operation()
   local accepted = request(method, path, body, function(res)
     if token ~= sequence then return end
-    if not ok(res) then finish_operation(error_text(res)); return end
+    -- A successful core restart may close the HTTP socket before its 204
+    -- arrives. Treat only that transport close as provisional success, then
+    -- require /version to come back before reporting the core as running.
+    local restart_disconnect = op == "restart_core" and res and
+      res.ok == false and (res.status == nil or res.status == 0)
+    if not ok(res) and not restart_disconnect then finish_operation(error_text(res)); return end
     finish_operation()
     if op == "restart_core" then
       generation = generation + 1; clear_live()

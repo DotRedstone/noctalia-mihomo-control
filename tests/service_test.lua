@@ -117,6 +117,19 @@ assert(state["nmc.operation"].busy, "delay operation not started")
 respond("/group/Choice/delay", "delay")
 assert(not state["nmc.operation"].busy)
 
+commands["nmc.command"]({ op = "restart_core" })
+for i, entry in ipairs(callbacks) do
+  if entry.req and entry.req.url:find("/restart", 1, true) then
+    table.remove(callbacks, i)
+    entry.cb({ ok = false, status = 0, body = "" })
+    break
+  end
+end
+assert(state["nmc.snapshot"].status == "starting")
+commands["nmc.command"]({ op = "refresh" })
+respond("/version", "version")
+assert(state["nmc.snapshot"].status == "running")
+
 commands["nmc.command"]({ op = "refresh" })
 respond("/version", "", 401)
 assert(state["nmc.snapshot"].status == "error")
