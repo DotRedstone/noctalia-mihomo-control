@@ -16,7 +16,8 @@ local known_errors = {
   ["helper status timeout"] = true, ["invalid helper status"] = true,
   ["helper unavailable"] = true, ["helper request rejected"] = true,
   ["stop health check failed"] = true, ["stop health check rejected"] = true,
-  ["operation timeout"] = true,
+  ["operation timeout"] = true, ["health check cancelled"] = true,
+  ["service stopped before API ready"] = true, ["helper status rejected"] = true,
 }
 local function error_message(value)
   if known_errors[value] then return tr("failure." .. value) end
@@ -113,29 +114,43 @@ render = function()
       color = "error", maxLines = 3 }))
   end
   if operation.busy then
-    table.insert(body, ui.label({ text = tr("working") .. " " .. (operation.name or ""),
-      color = "tertiary" }))
+    if operation.stage == "api" then
+      table.insert(body, ui.row({ gap = 8, align = "center" }, {
+        ui.label({ text = tr("waiting_api") .. " " .. tostring(operation.remaining or 0) .. "s",
+          color = "tertiary", flexGrow = 1 }),
+        button(tr("cancel_wait"), function() send("cancel_wait") end, true, "outline"),
+      }))
+    else
+      table.insert(body, ui.label({ text = tr("working") .. " " .. (operation.name or ""),
+        color = "tertiary" }))
+    end
   elseif operation.error and operation.error ~= "" then
     table.insert(body, ui.label({ text = tr("error") .. ": " .. error_message(operation.error), color = "error" }))
   end
 
   if snapshot.helper then
+    local service_running = snapshot.service_state == "running"
     table.insert(body, ui.row({ gap = 8 }, {
       button(tr("start"), function() send("start") end,
-        not online and not operation.busy and status ~= "starting"),
+        snapshot.service_state == "stopped" and not operation.busy),
       button(tr("stop"), function() send("stop") end,
-        online and not operation.busy),
+        service_running and not operation.busy),
       button(tr("restart_service"), function() send("restart_service") end,
-        online and not operation.busy),
+        service_running and not operation.busy),
     }))
   end
 
   if not online then
+    local empty_title = status == "starting" and "starting_title" or
+      (snapshot.service_state == "stopped" and "stopped_title" or "offline_title")
+    local empty_hint = status == "starting" and "starting_hint" or
+      (snapshot.service_state == "stopped" and "stopped_hint" or "offline_hint")
     table.insert(body, ui.column({ gap = 8, padding = 16,
       fill = "surface_container", radius = 12 }, {
       ui.glyph({ name = "network-off", size = 28, color = status_color }),
-      ui.label({ text = tr("offline_title"), fontWeight = "bold" }),
-      ui.label({ text = tr("offline_hint"), color = "on_surface_variant", maxLines = 3 }),
+      ui.label({ text = tr(empty_title), fontWeight = "bold" }),
+      ui.label({ text = tr(empty_hint),
+        color = "on_surface_variant", maxLines = 3 }),
       button(tr("open_settings"), function() noctalia.openSettings() end),
     }))
     panel.render(ui.column({ gap = 12, flexGrow = 1 }, body))

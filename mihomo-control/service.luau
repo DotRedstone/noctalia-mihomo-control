@@ -3,18 +3,24 @@
 -- Requests carry a generation so late callbacks cannot resurrect stale state.
 local snapshot = {
   status = "offline", error = "", mode = "", down = 0, up = 0,
-  count = 0, groups = {}, connections = {}, helper = false, version = "",
+  count = 0, groups = {}, connections = {}, helper = false, service_state = "unknown", version = "",
 }
-local operation = { busy = false, name = "", error = "" }
+local operation = { busy = false, name = "", stage = "", remaining = 0, error = "" }
 local generation, poll_tick, sequence = 0, 0, 0
+local probe_token, helper_token = 0, 0
 local probe_pending, helper_pending = false, false
 local probe_started, helper_started = 0, 0
 local traffic_stream = nil
 local config = {}
 local transition = nil
+local transition_phase = nil
 local transition_deadline = 0
 local operation_started = 0
 local operation_deadline = 0
+local helper_state = "unknown"
+local probe_suspended = false
+local HELPER_TIMEOUT = 18
+local API_READY_TIMEOUT = 180
 local finish_operation
 
 local function publish()
@@ -37,6 +43,9 @@ local function refresh_config()
   -- Refuse malformed credentials rather than putting CR/LF in an HTTP header.
   if string.find(config.secret, "[\r\n]") then config.secret = "" end
   snapshot.helper = string.sub(config.helper, 1, 1) == "/" and noctalia.fileExists(config.helper)
+  helper_state = snapshot.helper and "unknown" or "absent"
+  snapshot.service_state = helper_state
+  probe_suspended = false
 end
 
 local function headers(json)
@@ -82,11 +91,17 @@ end
 
 local function mark_offline(reason)
   clear_live()
-  snapshot.error = reason or "unreachable"
-  if transition == "start" or transition == "restart" then
-    snapshot.status = "starting"
+  if transition_phase == "api" then
+    -- A slow first boot is expected. Keep the wait visible without calling
+    -- every failed probe an error until the overall readiness deadline.
+    snapshot.status, snapshot.error = "starting", ""
+  elseif helper_state == "stopped" then
+    snapshot.status, snapshot.error = "offline", ""
+  elseif helper_state == "unknown" then
+    snapshot.status, snapshot.error = "offline", ""
   else
-    snapshot.status = snapshot.helper and "error" or "offline"
+    snapshot.error = reason or "unreachable"
+    snapshot.status = helper_state == "absent" and "offline" or "error"
   end
   publish()
 end
@@ -141,12 +156,17 @@ local function poll_details(current)
   request("GET", "/connections", nil, function(res)
     if current ~= generation then return end
     local data = decode(res)
-    if not data or type(data.connections) ~= "table" then return end
-    snapshot.count = #data.connections
+    if not data then return end
+    -- Mihomo may encode an empty collection as JSON null. Treat that as an
+    -- empty list so a previous nonzero count cannot remain on screen.
+    local raw = data.connections
+    if raw == nil then raw = {} end
+    if type(raw) ~= "table" then return end
+    snapshot.count = #raw
     local connections = {}
     -- Keep shared-state messages and panel rendering bounded on busy cores.
-    for i = 1, math.min(#data.connections, 40) do
-      local item = data.connections[i]
+    for i = 1, math.min(#raw, 40) do
+      local item = raw[i]
       local meta = type(item.metadata) == "table" and item.metadata or {}
       if type(item.id) == "string" then
         table.insert(connections, { id = item.id,
@@ -160,18 +180,20 @@ local function poll_details(current)
 end
 
 local function probe()
-  if probe_pending or transition == "stop" then return end
+  if probe_pending or transition == "stop" or probe_suspended then return end
+  if helper_state ~= "absent" and helper_state ~= "running" then return end
   probe_pending, probe_started = true, os.time()
-  local current = generation
+  probe_token = probe_token + 1
+  local current, token = generation, probe_token
   local accepted = request("GET", "/version", nil, function(res)
-    if current ~= generation then return end
+    if current ~= generation or token ~= probe_token then return end
     probe_pending = false
     local data = decode(res)
     if not data then mark_offline(error_text(res)); return end
     snapshot.version = tostring(data.version or "")
     snapshot.error = ""
-    if transition == "start" or transition == "restart" then
-      transition = nil
+    if transition_phase == "api" then
+      transition, transition_phase = nil, nil
       if operation.busy then finish_operation() end
     end
     snapshot.status = "running"
@@ -183,31 +205,68 @@ local function probe()
 end
 
 local function helper_status()
-  if not snapshot.helper or helper_pending or transition then return end
+  if not snapshot.helper or helper_pending or transition_phase == "service" or transition == "stop" then return end
   helper_pending, helper_started = true, os.time()
-  local current = generation
+  helper_token = helper_token + 1
+  local current, token = generation, helper_token
   local accepted = noctalia.runAsync({ config.helper, "status" }, function(result)
-    if current ~= generation then return end
+    if current ~= generation or token ~= helper_token then return end
     helper_pending = false
     if result.exitCode ~= 0 or result.timedOut then
+      generation, probe_token = generation + 1, probe_token + 1
+      probe_pending = false
+      helper_state, snapshot.service_state = "error", "error"
+      transition, transition_phase = nil, nil
+      if operation.busy then finish_operation("helper status failed") end
+      clear_live()
       snapshot.status, snapshot.error = "error", "helper status failed"
     else
       local status = (result.stdout or ""):match("^%s*(%a+)")
       if status == "stopped" then
+        generation, probe_token = generation + 1, probe_token + 1
+        probe_pending = false
+        helper_state, snapshot.service_state = "stopped", "stopped"
+        if transition_phase == "api" then
+          transition, transition_phase = nil, nil
+          finish_operation("service stopped before API ready")
+        end
         clear_live(); snapshot.status, snapshot.error = "offline", ""
-      elseif status == "running" and snapshot.status == "offline" then
-        snapshot.error = "unreachable"
-      elseif status ~= "running" then
+      elseif status == "running" then
+        helper_state, snapshot.service_state = "running", "running"
+        if transition_phase == "api" then
+          snapshot.status = "starting"
+        elseif snapshot.status ~= "running" then
+          snapshot.status = "error"
+          if not probe_suspended then snapshot.error = "unreachable" end
+        end
+        probe()
+      else
+        generation, probe_token = generation + 1, probe_token + 1
+        probe_pending = false
+        helper_state, snapshot.service_state = "error", "error"
+        transition, transition_phase = nil, nil
+        if operation.busy then finish_operation("invalid helper status") end
+        clear_live()
         snapshot.status, snapshot.error = "error", "invalid helper status"
       end
     end
     publish()
-  end)
-  if not accepted then helper_pending = false end
+  end, 8000)
+  if not accepted then
+    helper_pending = false
+    generation, probe_token = generation + 1, probe_token + 1
+    probe_pending = false
+    helper_state, snapshot.service_state = "error", "error"
+    transition, transition_phase = nil, nil
+    if operation.busy then finish_operation("helper request rejected") end
+    clear_live()
+    snapshot.status, snapshot.error = "error", "helper request rejected"
+    publish()
+  end
 end
 
 finish_operation = function(err)
-  operation = { busy = false, name = "", error = err or "" }
+  operation = { busy = false, name = "", stage = "", remaining = 0, error = err or "" }
   operation_started, operation_deadline = 0, 0
   publish_operation()
 end
@@ -218,13 +277,14 @@ local function lifecycle(verb)
   generation = generation + 1
   sequence = sequence + 1
   probe_pending, helper_pending = false, false
+  probe_suspended = false
   clear_live()
   operation_started = os.time()
-  operation_deadline = operation_started + 18
-  operation = { busy = true, name = verb, error = "" }
+  operation_deadline = operation_started + HELPER_TIMEOUT
+  operation = { busy = true, name = verb, stage = "service", remaining = HELPER_TIMEOUT, error = "" }
   publish_operation()
-  transition = verb
-  transition_deadline = os.time() + 15
+  transition, transition_phase = verb, "service"
+  transition_deadline = operation_deadline
   snapshot.status = verb == "stop" and "stopping" or "starting"
   snapshot.error = ""
   publish()
@@ -232,34 +292,56 @@ local function lifecycle(verb)
   local accepted = noctalia.runAsync({ config.helper, verb }, function(result)
     if current ~= generation or token ~= sequence then return end
     if result.timedOut or result.exitCode ~= 0 then
-      transition = nil
+      transition, transition_phase = nil, nil
+      helper_state, snapshot.service_state = "error", "error"
       snapshot.status, snapshot.error = "error", "helper " .. verb .. " failed"
       finish_operation(snapshot.error); publish(); return
     end
-    if verb == "stop" then
-      local queued = noctalia.runAsync({ config.helper, "status" }, function(check)
-        if current ~= generation or token ~= sequence then return end
-        if check.exitCode == 0 and not check.timedOut and
-          (check.stdout or ""):match("^%s*(%a+)") == "stopped" then
-          transition = nil; snapshot.status, snapshot.error = "offline", ""
-          finish_operation(); publish()
-        else
-          transition = nil; snapshot.status, snapshot.error = "error", "stop health check failed"
-          finish_operation(snapshot.error); publish()
-        end
-      end)
-      if not queued then
-        transition = nil; snapshot.status, snapshot.error = "error", "stop health check rejected"
+    -- The helper command and controller readiness are separate milestones.
+    -- Verify the service state before starting the longer API health wait.
+    transition_deadline = os.time() + 10
+    operation_deadline = transition_deadline
+    local queued = noctalia.runAsync({ config.helper, "status" }, function(check)
+      if current ~= generation or token ~= sequence then return end
+      local status = check.exitCode == 0 and not check.timedOut and
+        (check.stdout or ""):match("^%s*(%a+)") or nil
+      if verb == "stop" and status == "stopped" then
+        helper_state, snapshot.service_state = "stopped", "stopped"
+        transition, transition_phase = nil, nil
+        snapshot.status, snapshot.error = "offline", ""
+        finish_operation(); publish()
+      elseif verb ~= "stop" and status == "running" then
+        helper_state, snapshot.service_state = "running", "running"
+        transition_phase = "api"
+        transition_deadline = os.time() + API_READY_TIMEOUT
+        operation_started, operation_deadline = os.time(), transition_deadline
+        operation.stage, operation.remaining = "api", API_READY_TIMEOUT
+        publish_operation()
+        publish()
+        probe()
+      elseif status == "stopped" then
+        helper_state, snapshot.service_state = "stopped", "stopped"
+        transition, transition_phase = nil, nil
+        snapshot.status, snapshot.error = "offline", ""
+        finish_operation("service stopped before API ready"); publish()
+      else
+        helper_state, snapshot.service_state = "error", "error"
+        transition, transition_phase = nil, nil
+        snapshot.status, snapshot.error = "error", "helper status failed"
         finish_operation(snapshot.error); publish()
       end
-    else
-      -- A successful helper exit only means the command was accepted. The
-      -- API probe is the health check that completes start/restart.
-      probe()
+    end, 8000)
+    if not queued then
+      helper_state, snapshot.service_state = "error", "error"
+      transition, transition_phase = nil, nil
+      snapshot.status, snapshot.error = "error", "helper status rejected"
+      finish_operation(snapshot.error); publish()
     end
-  end)
+  end, 12000)
   if not accepted then
-    transition = nil; snapshot.status, snapshot.error = "error", "helper request rejected"
+    helper_state, snapshot.service_state = "error", "error"
+    transition, transition_phase = nil, nil
+    snapshot.status, snapshot.error = "error", "helper request rejected"
     finish_operation(snapshot.error); publish()
   end
 end
@@ -270,7 +352,22 @@ local function command(cmd)
   if op == "start" or op == "stop" or op == "restart_service" then
     lifecycle(op == "restart_service" and "restart" or op); return
   end
-  if op == "refresh" then probe(); return end
+  if op == "cancel_wait" and transition_phase == "api" then
+    generation, sequence = generation + 1, sequence + 1
+    probe_token, helper_token = probe_token + 1, helper_token + 1
+    probe_pending, helper_pending = false, false
+    probe_suspended = true
+    transition, transition_phase = nil, nil
+    clear_live()
+    snapshot.status, snapshot.error = "error", "health check cancelled"
+    finish_operation(); publish()
+    return
+  end
+  if op == "refresh" then
+    probe_suspended = false
+    if snapshot.helper then helper_status() else probe() end
+    return
+  end
   if snapshot.status ~= "running" or operation.busy then return end
   local method, path, body
   if op == "mode" and (cmd.mode == "rule" or cmd.mode == "global" or cmd.mode == "direct") then
@@ -342,12 +439,21 @@ local function command(cmd)
     local restart_disconnect = op == "restart_core" and res and
       res.ok == false and (res.status == nil or res.status == 0)
     if not ok(res) and not restart_disconnect then finish_operation(error_text(res)); return end
-    finish_operation()
     if op == "restart_core" then
       generation = generation + 1; clear_live()
-      snapshot.status = "starting"; transition = "restart"; transition_deadline = os.time() + 15
+      probe_pending = false
+      snapshot.status, snapshot.error = "starting", ""
+      transition, transition_phase = "restart", "api"
+      transition_deadline = os.time() + API_READY_TIMEOUT
+      operation_started, operation_deadline = os.time(), transition_deadline
+      operation.stage, operation.remaining = "api", API_READY_TIMEOUT
+      publish_operation()
       publish()
-    else poll_details(generation) end
+      probe()
+    else
+      finish_operation()
+      poll_details(generation)
+    end
   end)
   if not accepted then finish_operation("request rejected") end
 end
@@ -357,26 +463,45 @@ refresh_config()
 publish()
 publish_operation()
 noctalia.setUpdateInterval(2000)
+if snapshot.helper then helper_status() else probe() end
 
 function update()
   poll_tick = poll_tick + 1
   if probe_pending and os.time() - probe_started > 8 then
-    generation = generation + 1; probe_pending = false; mark_offline("health check timeout")
+    probe_token = probe_token + 1
+    probe_pending = false
+    mark_offline("health check timeout")
   end
   if helper_pending and os.time() - helper_started > 8 then
-    generation = generation + 1; helper_pending = false
+    helper_token = helper_token + 1
+    generation, probe_token = generation + 1, probe_token + 1
+    probe_pending = false
+    helper_pending = false
+    helper_state, snapshot.service_state = "error", "error"
+    transition, transition_phase = nil, nil
+    if operation.busy then finish_operation("helper status timeout") end
+    clear_live()
     snapshot.status, snapshot.error = "error", "helper status timeout"; publish()
   end
   if transition and os.time() > transition_deadline then
-    generation = generation + 1; sequence = sequence + 1
-    transition = nil; snapshot.status, snapshot.error = "error", "health check timeout"
+    local reason = transition_phase == "api" and "health check timeout" or "operation timeout"
+    generation, sequence, probe_token, helper_token =
+      generation + 1, sequence + 1, probe_token + 1, helper_token + 1
+    probe_pending, helper_pending, probe_suspended = false, false, true
+    transition, transition_phase = nil, nil
+    snapshot.status, snapshot.error = "error", reason
     finish_operation(snapshot.error); publish()
   end
-  if operation.busy and operation_started > 0 and os.time() > operation_deadline then
+  if operation.busy and not transition and operation_started > 0 and os.time() > operation_deadline then
     sequence = sequence + 1
-    transition = nil; snapshot.status = "error"
-    snapshot.error = "operation timeout"
-    finish_operation(snapshot.error); publish()
+    finish_operation("operation timeout")
+  end
+  if transition_phase == "api" then
+    local remaining = math.max(0, transition_deadline - os.time())
+    if operation.remaining ~= remaining then
+      operation.remaining = remaining
+      publish_operation()
+    end
   end
   if poll_tick % 2 == 1 then probe() end
   if poll_tick % 3 == 0 then helper_status() end
@@ -384,14 +509,17 @@ function update()
 end
 
 function onConfigChanged()
-  generation = generation + 1; sequence = sequence + 1
-  clear_live(); probe_pending, helper_pending, transition = false, false, nil
+  generation, sequence, probe_token, helper_token = generation + 1, sequence + 1, probe_token + 1, helper_token + 1
+  clear_live()
+  probe_pending, helper_pending, transition, transition_phase = false, false, nil, nil
   finish_operation()
-  refresh_config(); snapshot.status = "offline"; publish(); probe()
+  refresh_config(); snapshot.status, snapshot.error = "offline", ""
+  publish()
+  if snapshot.helper then helper_status() else probe() end
 end
 
 function onIpc(event, payload)
-  if event == "refresh" then probe()
+  if event == "refresh" then command({ op = "refresh" })
   elseif event == "command" then command(noctalia.json.decode(payload or "")) end
 end
 
