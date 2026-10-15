@@ -5,7 +5,7 @@ local function ui_node(kind)
   end
 end
 local ui = {}
-for _, kind in ipairs({ "row", "column", "scroll", "label", "glyph", "button", "separator" }) do
+for _, kind in ipairs({ "row", "column", "scroll", "label", "glyph", "button", "separator", "input" }) do
   ui[kind] = ui_node(kind)
 end
 local host = {
@@ -39,6 +39,7 @@ assert(loadfile("mihomo-control/panel.luau", "t", panel_env))()
 panel_env.onOpen()
 assert(contains(rendered.panel, "offline_title"))
 assert(not contains(rendered.panel, "start"), "helper action shown without helper")
+assert(not contains(rendered.panel, "profiles"), "profile UI shown without helper")
 
 local online = { status = "running", error = "", version = "test", mode = "rule",
   helper = true, down = 10, up = 5, count = 1,
@@ -54,6 +55,28 @@ watches["nmc.snapshot"](online)
 assert(contains(rendered.panel, "stopped_title"))
 assert(find_button(rendered.panel, "start").props.enabled)
 assert(not find_button(rendered.panel, "stop").props.enabled)
+watches["nmc.profiles"]({ available = true, items = {
+  { id = "base", name = "Base" }, { id = "second", name = "Second" } },
+  active = "base", loading = false, error = "", notice = "" })
+assert(contains(rendered.panel, "profiles"))
+assert(contains(rendered.panel, "Second"))
+find_button(rendered.panel, "profile_activate").props.onClick()
+assert(state["nmc.command"].op == "profile_activate" and state["nmc.command"].id == "second")
+local function find_input(node)
+  if node.kind == "input" then return node end
+  for _, child in ipairs(node.children or {}) do
+    local found = find_input(child)
+    if found then return found end
+  end
+end
+find_input(rendered.panel).props.onChange("/tmp/synthetic.yaml")
+find_button(rendered.panel, "profile_import").props.onClick()
+assert(state["nmc.command"].op == "profile_import" and state["nmc.command"].path == "/tmp/synthetic.yaml")
+local many_profiles = {}
+for i = 1, 100 do many_profiles[i] = { id = "profile-" .. i, name = "Profile " .. i } end
+watches["nmc.profiles"]({ available = true, items = many_profiles,
+  active = "profile-1", loading = false, error = "", notice = "" })
+assert(not contains(rendered.panel, "Profile 100"), "profile list was not paginated")
 online.status, online.service_state = "starting", "running"
 watches["nmc.snapshot"](online)
 watches["nmc.operation"]({ busy = true, name = "start", stage = "api", remaining = 150, error = "" })
