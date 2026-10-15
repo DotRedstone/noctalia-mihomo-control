@@ -1,6 +1,6 @@
 id = "nmc/mihomo-control"
 name = "Mihomo Control"
-version = "0.1.0"
+version = "0.2.0"
 plugin_api = 24
 author = "Mihomo Control contributors"
 license = "MIT"
@@ -28,6 +28,13 @@ key = "helper_path"
 type = "file"
 label_key = "settings.helper"
 description_key = "settings.helper_description"
+default = ""
+
+[[setting]]
+key = "profile_helper_path"
+type = "file"
+label_key = "settings.profile_helper"
+description_key = "settings.profile_helper_description"
 default = ""
 
 [[setting]]

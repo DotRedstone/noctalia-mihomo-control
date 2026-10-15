@@ -3,8 +3,11 @@
 -- are untrusted controller data, so no text is ever used as a shell command.
 local snapshot = noctalia.state.get("nmc.snapshot") or { status = "offline", groups = {}, connections = {} }
 local operation = noctalia.state.get("nmc.operation") or { busy = false, error = "" }
+local profiles = noctalia.state.get("nmc.profiles") or { available = false, items = {}, active = "" }
 local opened = false
 local serial = 0
+local import_path = ""
+local profile_page = 1
 local expanded_group = nil
 local group_page, member_page = 1, 1
 local render
@@ -94,6 +97,60 @@ local function connection_view(item)
   })
 end
 
+local function profile_view()
+  local rows = {
+    ui.row({ gap = 8, align = "center" }, {
+      ui.label({ text = tr("profiles"), fontWeight = "bold", color = "primary", flexGrow = 1 }),
+      button(tr("profiles_refresh"), function() send("profiles_refresh") end,
+        not operation.busy and not profiles.loading, "outline"),
+    }),
+  }
+  if profiles.error and profiles.error ~= "" then
+    table.insert(rows, ui.label({ text = tr("profile_error") .. ": " .. tr(profiles.error),
+      color = "error", maxLines = 3 }))
+  end
+  if profiles.notice and profiles.notice ~= "" then
+    table.insert(rows, ui.label({ text = tr(profiles.notice), color = "primary" }))
+  end
+  if profiles.loading then
+    table.insert(rows, ui.label({ text = tr("profiles_loading"), color = "on_surface_variant" }))
+  end
+  local items = profiles.items or {}
+  if #items == 0 and not profiles.loading then
+    table.insert(rows, ui.label({ text = tr("profiles_empty"), color = "on_surface_variant" }))
+  end
+  local pages = math.max(1, math.ceil(#items / 4))
+  profile_page = math.min(profile_page, pages)
+  for i = (profile_page - 1) * 4 + 1, math.min(profile_page * 4, #items) do
+    local item = items[i]
+    local active = item.id == profiles.active
+    table.insert(rows, ui.row({ key = "profile:" .. item.id, gap = 8, align = "center" }, {
+      ui.label({ text = item.name, maxLines = 1, flexGrow = 1,
+        color = active and "primary" or "on_surface" }),
+      button(active and tr("profile_active") or tr("profile_activate"),
+        function() send("profile_activate", { id = item.id }) end,
+        not active and not operation.busy and not profiles.loading,
+        active and "secondary" or "outline"),
+    }))
+  end
+  if pages > 1 then
+    table.insert(rows, ui.row({ gap = 8, align = "center" }, {
+      button(tr("previous"), function() profile_page = profile_page - 1; render() end, profile_page > 1),
+      ui.label({ text = tostring(profile_page) .. "/" .. tostring(pages) }),
+      button(tr("next"), function() profile_page = profile_page + 1; render() end, profile_page < pages),
+    }))
+  end
+  table.insert(rows, ui.label({ text = tr("profile_import_hint"), color = "on_surface_variant", maxLines = 3 }))
+  table.insert(rows, ui.input({ key = "profile-import-path", value = "", controlSize = "sm",
+    placeholder = tr("profile_path_placeholder"), enabled = not operation.busy,
+    onChange = function(value) import_path = value; render() end,
+    onSubmit = function(value) send("profile_import", { path = value or import_path }) end }))
+  table.insert(rows, button(tr("profile_import"),
+    function() send("profile_import", { path = import_path }) end,
+    not operation.busy and not profiles.loading and import_path ~= ""))
+  return ui.column({ gap = 8, padding = 10, fill = "surface_container", radius = 10 }, rows)
+end
+
 render = function()
   if not opened then return end
   local status = snapshot.status or "offline"
@@ -139,6 +196,7 @@ render = function()
         service_running and not operation.busy),
     }))
   end
+  if profiles.available then table.insert(body, profile_view()) end
 
   if not online then
     local empty_title = status == "starting" and "starting_title" or
@@ -217,6 +275,10 @@ noctalia.state.watch("nmc.snapshot", function(value)
 end)
 noctalia.state.watch("nmc.operation", function(value)
   operation = value or { busy = false, error = "" }
+  render()
+end)
+noctalia.state.watch("nmc.profiles", function(value)
+  profiles = value or { available = false, items = {}, active = "" }
   render()
 end)
 

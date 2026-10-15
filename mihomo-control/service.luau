@@ -6,7 +6,9 @@ local snapshot = {
   count = 0, groups = {}, connections = {}, helper = false, service_state = "unknown", version = "",
 }
 local operation = { busy = false, name = "", stage = "", remaining = 0, error = "" }
+local profiles = { available = false, items = {}, active = "", loading = false, error = "", notice = "" }
 local generation, poll_tick, sequence = 0, 0, 0
+local profile_token, profile_started = 0, 0
 local probe_token, helper_token = 0, 0
 local probe_pending, helper_pending = false, false
 local probe_started, helper_started = 0, 0
@@ -31,6 +33,10 @@ local function publish_operation()
   noctalia.state.set("nmc.operation", operation)
 end
 
+local function publish_profiles()
+  noctalia.state.set("nmc.profiles", profiles)
+end
+
 local function number(value)
   return math.max(0, tonumber(value) or 0)
 end
@@ -39,10 +45,13 @@ local function refresh_config()
   config.port = tonumber(noctalia.getConfig("controller_port")) or 9090
   config.secret = noctalia.getConfig("controller_secret") or ""
   config.helper = noctalia.getConfig("helper_path") or ""
+  config.profile_helper = noctalia.getConfig("profile_helper_path") or ""
   config.test_url = noctalia.getConfig("test_url") or "https://www.gstatic.com/generate_204"
   -- Refuse malformed credentials rather than putting CR/LF in an HTTP header.
   if string.find(config.secret, "[\r\n]") then config.secret = "" end
   snapshot.helper = string.sub(config.helper, 1, 1) == "/" and noctalia.fileExists(config.helper)
+  profiles.available = string.sub(config.profile_helper, 1, 1) == "/" and
+    noctalia.fileExists(config.profile_helper)
   helper_state = snapshot.helper and "unknown" or "absent"
   snapshot.service_state = helper_state
   probe_suspended = false
@@ -346,9 +355,129 @@ local function lifecycle(verb)
   end
 end
 
+local function valid_profile_id(value)
+  return type(value) == "string" and #value >= 1 and #value <= 64 and
+    value:match("^[A-Za-z0-9][A-Za-z0-9._-]*$") ~= nil
+end
+
+local function profile_failure(result, verb)
+  if result.timedOut then return "profile_timeout" end
+  if verb == "activate" and result.exitCode == 75 then return "profile_rolled_back" end
+  if verb == "activate" and result.exitCode == 76 then return "profile_rollback_failed" end
+  if result.exitCode == 65 then return "profile_invalid" end
+  if result.exitCode == 66 then return "profile_unreadable" end
+  return "profile_" .. verb .. "_failed"
+end
+
+local function list_profiles(preserve_message, expected_id, expected_action)
+  if not profiles.available or profiles.loading or operation.busy then return end
+  profile_token = profile_token + 1
+  local token = profile_token
+  profiles.loading, profile_started = true, os.time()
+  if not preserve_message then profiles.error, profiles.notice = "", "" end
+  publish_profiles()
+  local accepted = noctalia.runAsync({ config.profile_helper, "list" }, function(result)
+    if token ~= profile_token then return end
+    profiles.loading = false
+    if result.timedOut or result.exitCode ~= 0 or result.stdoutTruncated then
+      if profiles.error == "" then profiles.error = "profile_list_failed" end
+      publish_profiles(); return
+    end
+    local data = noctalia.json.decode(result.stdout or "")
+    if type(data) ~= "table" or type(data.profiles) ~= "table" or
+      type(data.active) ~= "string" or #data.profiles > 100 then
+      profiles.error = "profile_invalid_response"; publish_profiles(); return
+    end
+    local items, known = {}, {}
+    for _, item in ipairs(data.profiles) do
+      if type(item) ~= "table" or not valid_profile_id(item.id) or known[item.id] or
+        type(item.name) ~= "string" or #item.name < 1 or #item.name > 80 or
+        item.name:find("[%c]") then
+        profiles.error = "profile_invalid_response"; publish_profiles(); return
+      end
+      known[item.id] = true
+      table.insert(items, { id = item.id, name = item.name })
+    end
+    if data.active ~= "" and not known[data.active] then
+      profiles.error = "profile_invalid_response"; publish_profiles(); return
+    end
+    -- 只在整份列表通过校验后替换缓存，避免畸形输出掩盖仍可用的配置。
+    profiles.items, profiles.active = items, data.active
+    if expected_action == "activate" and data.active ~= expected_id then
+      profiles.error = "profile_activation_unconfirmed"
+    elseif expected_action == "import" and not known[expected_id] then
+      profiles.error = "profile_import_unconfirmed"
+    elseif expected_action then
+      profiles.notice = expected_action == "import" and "profile_imported" or "profile_activated"
+      if expected_action == "activate" then
+        if snapshot.helper then helper_status() else probe() end
+      end
+    end
+    publish_profiles()
+  end, 8000)
+  if not accepted then
+    profiles.loading = false
+    profiles.error = "profile_list_failed"
+    publish_profiles()
+  end
+end
+
+local function profile_action(verb, value)
+  if not profiles.available or operation.busy or profiles.loading then return end
+  if verb == "import" then
+    -- 路径仅作为单个 argv 参数传递；文件类型、大小、YAML 校验、存储和回退均由宿主负责。
+    if type(value) ~= "string" or value:sub(1, 1) ~= "/" or #value > 4096 or
+      value:find("[%c]") then
+      profiles.error = "profile_path_invalid"; publish_profiles(); return
+    end
+  else
+    local known = false
+    for _, item in ipairs(profiles.items) do
+      if item.id == value then known = true; break end
+    end
+    if not known or value == profiles.active then return end
+  end
+  profile_token = profile_token + 1
+  local token = profile_token
+  profiles.error, profiles.notice = "", ""
+  publish_profiles()
+  sequence = sequence + 1
+  operation_started = os.time()
+  operation_deadline = operation_started + 65
+  operation = { busy = true, name = "profile_" .. verb, stage = "profile", error = "" }
+  publish_operation()
+  local accepted = noctalia.runAsync({ config.profile_helper, verb, value }, function(result)
+    if token ~= profile_token then return end
+    if result.timedOut or result.exitCode ~= 0 or result.stdoutTruncated then
+      profiles.error = profile_failure(result, verb)
+      if verb == "activate" and result.exitCode ~= 75 then profiles.active = "" end
+      finish_operation()
+      publish_profiles()
+      if verb == "activate" then list_profiles(true) end
+      return
+    end
+    local data = noctalia.json.decode(result.stdout or "")
+    if type(data) ~= "table" or not valid_profile_id(data.id) or
+      (verb == "activate" and data.id ~= value) then
+      profiles.error = "profile_invalid_response"
+      if verb == "activate" then profiles.active = "" end
+      finish_operation(); publish_profiles(); return
+    end
+    if verb == "activate" then profiles.active = "" end
+    finish_operation(); list_profiles(true, data.id, verb)
+  end, 60000)
+  if not accepted then
+    profiles.error = "profile_" .. verb .. "_failed"
+    finish_operation(); publish_profiles()
+  end
+end
+
 local function command(cmd)
   if type(cmd) ~= "table" or type(cmd.op) ~= "string" then return end
   local op = cmd.op
+  if op == "profiles_refresh" then list_profiles(false); return end
+  if op == "profile_import" then profile_action("import", cmd.path); return end
+  if op == "profile_activate" then profile_action("activate", cmd.id); return end
   if op == "start" or op == "stop" or op == "restart_service" then
     lifecycle(op == "restart_service" and "restart" or op); return
   end
@@ -366,6 +495,7 @@ local function command(cmd)
   if op == "refresh" then
     probe_suspended = false
     if snapshot.helper then helper_status() else probe() end
+    list_profiles(false)
     return
   end
   if snapshot.status ~= "running" or operation.busy then return end
@@ -462,11 +592,18 @@ noctalia.state.watch("nmc.command", command)
 refresh_config()
 publish()
 publish_operation()
+publish_profiles()
 noctalia.setUpdateInterval(2000)
 if snapshot.helper then helper_status() else probe() end
+if profiles.available then list_profiles(false) end
 
 function update()
   poll_tick = poll_tick + 1
+  if profiles.loading and os.time() - profile_started > 10 then
+    profile_token = profile_token + 1
+    profiles.loading, profiles.error = false, "profile_list_failed"
+    publish_profiles()
+  end
   if probe_pending and os.time() - probe_started > 8 then
     probe_token = probe_token + 1
     probe_pending = false
@@ -494,7 +631,14 @@ function update()
   end
   if operation.busy and not transition and operation_started > 0 and os.time() > operation_deadline then
     sequence = sequence + 1
-    finish_operation("operation timeout")
+    if operation.stage == "profile" then
+      profile_token = profile_token + 1
+      profiles.error = "profile_timeout"
+      publish_profiles()
+      finish_operation()
+    else
+      finish_operation("operation timeout")
+    end
   end
   if transition_phase == "api" then
     local remaining = math.max(0, transition_deadline - os.time())
@@ -510,12 +654,16 @@ end
 
 function onConfigChanged()
   generation, sequence, probe_token, helper_token = generation + 1, sequence + 1, probe_token + 1, helper_token + 1
+  profile_token = profile_token + 1
   clear_live()
   probe_pending, helper_pending, transition, transition_phase = false, false, nil, nil
   finish_operation()
+  profiles = { available = false, items = {}, active = "", loading = false, error = "", notice = "" }
   refresh_config(); snapshot.status, snapshot.error = "offline", ""
   publish()
+  publish_profiles()
   if snapshot.helper then helper_status() else probe() end
+  if profiles.available then list_profiles(false) end
 end
 
 function onIpc(event, payload)
